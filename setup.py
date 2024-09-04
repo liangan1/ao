@@ -6,24 +6,38 @@
 import os
 import glob
 from datetime import datetime
+import subprocess
 
 from setuptools import find_packages, setup
 
-current_date = datetime.now().strftime("%Y.%m.%d")
+current_date = datetime.now().strftime("%Y%m%d")
+
+
+def get_git_commit_id():
+    try:
+        return subprocess.check_output(['git', 'rev-parse', '--short', 'HEAD']).decode('ascii').strip()
+    except Exception:
+        return ""
 
 def read_requirements(file_path):
     with open(file_path, "r") as file:
         return file.read().splitlines()
 
+def read_version(file_path="version.txt"):
+    with open(file_path, "r") as file:
+        return file.readline().strip()
 
-# Determine the package name based on the presence of an environment variable
-package_name = "torchao-nightly" if os.environ.get("TORCHAO_NIGHTLY") else "torchao"
-version_suffix = os.getenv("VERSION_SUFFIX", "")
+
+# Use Git commit ID if VERSION_SUFFIX is not set
+version_suffix = os.getenv("VERSION_SUFFIX")
+if version_suffix is None:
+    version_suffix = f"+git{get_git_commit_id()}"
+
 use_cpp = os.getenv('USE_CPP')
 
-
-# Version is year.month.date if using nightlies
-version = current_date if package_name == "torchao-nightly" else "0.2.0"
+version_prefix = read_version()
+# Version is version.dev year month date if using nightlies and version if not
+version = f"{version_prefix}.dev{current_date}" if os.environ.get("TORCHAO_NIGHTLY") else version_prefix
 
 import torch
 
@@ -32,6 +46,7 @@ from torch.utils.cpp_extension import (
     CUDAExtension,
     BuildExtension,
     CUDA_HOME,
+    IS_WINDOWS
 )
 
 
@@ -49,21 +64,41 @@ def get_extensions():
     use_cuda = torch.cuda.is_available() and CUDA_HOME is not None
     extension = CUDAExtension if use_cuda else CppExtension
 
-    extra_link_args = ["-fopenmp"]
-    extra_compile_args = {
-        "cxx": [
-            "-O3" if not debug_mode else "-O0",
-            "-fdiagnostics-color=always",
-            "-fopenmp",
-        ],
-        "nvcc": [
-            "-O3" if not debug_mode else "-O0",
-        ]
-    }
-    if debug_mode:
-        extra_compile_args["cxx"].append("-g")
-        extra_compile_args["nvcc"].append("-g")
-        extra_link_args.extend(["-O0", "-g"])
+    if not IS_WINDOWS:
+        extra_link_args = []
+        extra_compile_args = {
+            "cxx": [
+                "-O3" if not debug_mode else "-O0",
+                "-fdiagnostics-color=always",
+            ],
+            "nvcc": [
+                "-O3" if not debug_mode else "-O0",
+                "-t=0",
+            ]
+        }
+
+        if debug_mode:
+            extra_compile_args["cxx"].append("-g")
+            extra_compile_args["nvcc"].append("-g")
+            extra_link_args.extend(["-O0", "-g"])
+
+    else:
+        extra_link_args = []
+        extra_compile_args = {
+            "cxx": [
+                "/O2" if not debug_mode else "/Od",
+                "/permissive-"
+            ],
+            "nvcc": [
+                "-O3" if not debug_mode else "-O0",
+                "-t=0",
+            ]
+        }
+
+        if debug_mode:
+            extra_compile_args["cxx"].append("/ZI")
+            extra_compile_args["nvcc"].append("-g")
+            extra_link_args.append("/DEBUG")
 
     this_dir = os.path.dirname(os.path.curdir)
     extensions_dir = os.path.join(this_dir, "torchao", "csrc")
@@ -87,7 +122,7 @@ def get_extensions():
     return ext_modules
 
 setup(
-    name=package_name,
+    name="torchao",
     version=version+version_suffix,
     packages=find_packages(),
     include_package_data=True,
@@ -95,7 +130,6 @@ setup(
         "torchao.kernel.configs": ["*.pkl"],
     },
     ext_modules=get_extensions() if use_cpp != "0" else None,
-    install_requires=read_requirements("requirements.txt"),
     extras_require={"dev": read_requirements("dev-requirements.txt")},
     description="Package for applying ao techniques to GPU models",
     long_description=open("README.md").read(),

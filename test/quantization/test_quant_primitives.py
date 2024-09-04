@@ -9,17 +9,28 @@
 import unittest
 import torch
 from torchao.quantization.quant_primitives import (
-    get_group_qparams_symmetric,
-    get_groupwise_affine_qparams,
+    fake_quantize_affine,
+    fake_quantize_affine_cachemask,
     quantize_affine,
     dequantize_affine,
     choose_qparams_affine,
     MappingType,
+    ZeroPointDomain,
+)
+# TODO: remove test for utils?
+from torchao.quantization.utils import (
+    get_group_qparams_symmetric,
+    get_groupwise_affine_qparams,
+    groupwise_affine_quantize_tensor_from_qparams,
+    groupwise_affine_dequantize_tensor_from_qparams,
+    quantize_activation_per_token_absmax,
 )
 
-from torchao.quantization.utils import (
-    TORCH_VERSION_AFTER_2_3,
-    TORCH_VERSION_AFTER_2_4,
+from torchao.utils import (
+    TORCH_VERSION_AT_LEAST_2_3,
+    TORCH_VERSION_AT_LEAST_2_4,
+    TORCH_VERSION_AT_LEAST_2_5,
+    is_fbcode,
 )
 
 _SEED = 1234
@@ -38,11 +49,93 @@ def check_idempotent(self, fn, *args, **kwargs):
     self.assertTrue(torch.equal(output0, output1), f"Expected given function {fn} to be idempotent.")
     return output1
 
+# Legacy tinygemm ops
+def _get_groupwise_affine_qparams(w, n_bit=4, groupsize=128, dtype=torch.bfloat16):
+    if groupsize > w.shape[-1]:
+        groupsize = w.shape[-1]
+    assert groupsize > 1
+    assert w.shape[-1] % groupsize == 0
+    assert w.dim() == 2
+
+    to_quant = w.reshape(-1, groupsize)
+    # assert torch.isnan(to_quant).sum() == 0
+
+    max_val = to_quant.amax(dim=1, keepdim=True)
+    min_val = to_quant.amin(dim=1, keepdim=True)
+    max_int = 2**n_bit - 1
+    scales = (max_val - min_val).clamp(min=1e-6) / max_int
+    zeros = min_val + scales * (2 ** (n_bit - 1))
+    return scales.to(dtype=dtype).reshape(w.shape[0], -1), zeros.to(
+        dtype=dtype
+    ).reshape(w.shape[0], -1)
+
+def _groupwise_affine_quantize_tensor_from_qparams(
+    w,
+    scales,
+    zeros,
+    n_bit=4,
+    groupsize=128,
+):
+    assert groupsize > 1
+    # needed for GPTQ single column quantize
+    if groupsize > w.shape[-1] and scales.shape[-1] == 1:
+        groupsize = w.shape[-1]
+
+    assert w.shape[-1] % groupsize == 0
+    assert w.dim() == 2
+
+    to_quant = w.reshape(-1, groupsize)
+    # assert torch.isnan(to_quant).sum() == 0
+
+    scales = scales.reshape(-1, 1)
+    zeros = zeros.reshape(-1, 1)
+    min_val = zeros - scales * (2 ** (n_bit - 1))
+    max_int = 2**n_bit - 1
+    min_int = 0
+    w_int4x8 = (
+        to_quant.sub(min_val)
+        .div(scales)
+        .round()
+        .clamp_(min_int, max_int)
+        .to(torch.int32)
+        .reshape_as(w)
+    )
+    if TORCH_VERSION_AT_LEAST_2_5:
+        w_int4x8 = (w_int4x8[::, ::2] << 4 | w_int4x8[::, 1::2]).to(torch.uint8)
+
+    return w_int4x8
+
+def _groupwise_affine_dequantize_tensor_from_qparams(
+    w_int4x8,
+    scales,
+    zeros,
+    n_bit=4,
+    groupsize=128,
+):
+    assert groupsize > 1
+    # needed for GPTQ single column dequantize
+    if groupsize > w_int4x8.shape[-1] and scales.shape[-1] == 1:
+        groupsize = w_int4x8.shape[-1]
+    assert w_int4x8.shape[-1] % groupsize == 0
+    assert w_int4x8.dim() == 2
+
+    w_int4x8_grouped = w_int4x8.reshape(-1, groupsize)
+    scales = scales.reshape(-1, 1)
+    zeros = zeros.reshape(-1, 1)
+
+    w_dq = (
+        w_int4x8_grouped.sub(2 ** (n_bit - 1))
+        .mul(scales)
+        .add(zeros)
+        .reshape_as(w_int4x8)
+    )
+    return w_dq
+
 
 class TestQuantPrimitives(unittest.TestCase):
     SEED = 123
 
-    @unittest.skipIf(not TORCH_VERSION_AFTER_2_3, "skipping when torch version is 2.3 or lower")
+    @unittest.skipIf(not TORCH_VERSION_AT_LEAST_2_3, "skipping when torch version is 2.3 or lower")
     def test_get_group_qparams_symmetric(self):
         """
         Test that `get_group_qparams_symmetric` produces the exact same scales as
@@ -91,7 +184,8 @@ class TestQuantPrimitives(unittest.TestCase):
         self.assertTrue(torch.equal(scale, scale_ref))
         self.assertTrue(torch.equal(zero_point, zp_ref))
 
-    @unittest.skipIf(not TORCH_VERSION_AFTER_2_3, "skipping when torch version is 2.3 or lower")
+    @unittest.skipIf(not TORCH_VERSION_AT_LEAST_2_3, "skipping when torch version is 2.3 or lower")
+    @unittest.skipIf(is_fbcode(), "broken in fbcode")
     def test_choose_qparams_token_asym(self):
         input = torch.randn(10, 10)
         mapping_type = MappingType.ASYMMETRIC
@@ -106,6 +200,7 @@ class TestQuantPrimitives(unittest.TestCase):
         torch.testing.assert_close(scale, scale_ref, atol=10e-3, rtol=10e-3)
         self.assertTrue(torch.equal(zero_point, zp_ref))
 
+    @unittest.skipIf(is_fbcode(), "broken in fbcode")
     def test_choose_qparams_tensor_asym(self):
         input = torch.randn(10, 10)
         mapping_type = MappingType.ASYMMETRIC
@@ -124,6 +219,7 @@ class TestQuantPrimitives(unittest.TestCase):
         self.assertTrue(torch.equal(scale, scale_ref))
         self.assertTrue(torch.equal(zero_point, zp_ref))
 
+    @unittest.skipIf(is_fbcode(), "broken in fbcode")
     def test_choose_qparams_tensor_sym(self):
         input = torch.randn(10, 10)
         mapping_type = MappingType.SYMMETRIC
@@ -141,9 +237,8 @@ class TestQuantPrimitives(unittest.TestCase):
         self.assertTrue(torch.equal(scale, scale_ref))
         self.assertTrue(torch.equal(zero_point, zp_ref))
 
-    @unittest.skipIf(not TORCH_VERSION_AFTER_2_4, "skipping when torch version is 2.4 or lower")
+    @unittest.skipIf(not TORCH_VERSION_AT_LEAST_2_4, "skipping when torch version is 2.4 or lower")
     def test_quantize_activation_per_token_abs_max(self):
-        from torchao.quantization.quant_primitives import quantize_activation_per_token_absmax
         input = torch.randn(10, 10)
         quantized_ref, scale_ref = quantize_activation_per_token_absmax(input)
 
@@ -162,17 +257,15 @@ class TestQuantPrimitives(unittest.TestCase):
         self.assertTrue(torch.equal(quantized, quantized_ref))
         self.assertTrue(torch.equal(scale, scale_ref))
 
-    @unittest.skipIf(not TORCH_VERSION_AFTER_2_4, "skipping when torch version is 2.4 or lower")
+    @unittest.skipIf(not TORCH_VERSION_AT_LEAST_2_4, "skipping when torch version is 2.4 or lower")
     def test_quantize_activation_per_token_abs_max_zero_input(self):
-        from torchao.quantization.quant_primitives import quantize_activation_per_token_absmax
         input = torch.zeros(10, 10)
         # make sure it still works
         quantized_ref, scale_ref = quantize_activation_per_token_absmax(input)
 
 
-    @unittest.skipIf(not TORCH_VERSION_AFTER_2_4, "skipping when torch version is 2.4 or lower")
+    @unittest.skipIf(not TORCH_VERSION_AT_LEAST_2_4, "skipping when torch version is 2.4 or lower")
     def test_quantize_activation_per_token_abs_max_dtype(self):
-        from torchao.quantization.quant_primitives import quantize_activation_per_token_absmax
         input = torch.zeros(10, 10, dtype=torch.bfloat16)
         quantized_ref, scale_ref = quantize_activation_per_token_absmax(input)
         self.assertTrue(scale_ref.dtype, torch.bfloat16)
@@ -186,7 +279,8 @@ class TestQuantPrimitives(unittest.TestCase):
         self.assertTrue(scale_ref.dtype, torch.float32)
 
 
-    @unittest.skipIf(not TORCH_VERSION_AFTER_2_4, "skipping when torch version is 2.4 or lower")
+    @unittest.skipIf(not TORCH_VERSION_AT_LEAST_2_4, "skipping when torch version is 2.4 or lower")
+    @unittest.skipIf(is_fbcode(), "broken in fbcode")
     def test_quantize_dequantize_group_sym(self):
         input = torch.randn(10, 10)
         mapping_type = MappingType.SYMMETRIC
@@ -210,7 +304,8 @@ class TestQuantPrimitives(unittest.TestCase):
         self.assertTrue(torch.equal(quantized, quantized_ref))
         self.assertTrue(torch.equal(dequantized, dequantized_ref))
 
-    @unittest.skipIf(not TORCH_VERSION_AFTER_2_4, "skipping when torch version is 2.4 or lower")
+    @unittest.skipIf(not TORCH_VERSION_AT_LEAST_2_4, "skipping when torch version is 2.4 or lower")
+    @unittest.skipIf(is_fbcode(), "broken in fbcode")
     def test_quantize_dequantize_channel_asym(self):
         input = torch.randn(10, 10)
         mapping_type = MappingType.ASYMMETRIC
@@ -233,7 +328,8 @@ class TestQuantPrimitives(unittest.TestCase):
         self.assertTrue(torch.equal(quantized, quantized_ref))
         self.assertTrue(torch.equal(dequantized, dequantized_ref))
 
-    @unittest.skipIf(not TORCH_VERSION_AFTER_2_4, "skipping when torch version is 2.4 or lower")
+    @unittest.skipIf(not TORCH_VERSION_AT_LEAST_2_4, "skipping when torch version is 2.4 or lower")
+    @unittest.skipIf(is_fbcode(), "broken in fbcode")
     def test_quantize_dequantize_tensor_asym(self):
         input = torch.randn(10, 10)
         mapping_type = MappingType.ASYMMETRIC
@@ -256,7 +352,8 @@ class TestQuantPrimitives(unittest.TestCase):
         self.assertTrue(torch.equal(quantized, quantized_ref))
         self.assertTrue(torch.equal(dequantized, dequantized_ref))
 
-    @unittest.skipIf(not TORCH_VERSION_AFTER_2_4, "skipping when torch version is 2.4 or lower")
+    @unittest.skipIf(not TORCH_VERSION_AT_LEAST_2_4, "skipping when torch version is 2.4 or lower")
+    @unittest.skipIf(is_fbcode(), "broken in fbcode")
     def test_quantize_dequantize_channel_asym_4d(self):
         input = torch.randn(3, 3, 10, 10)
         mapping_type = MappingType.ASYMMETRIC
@@ -278,7 +375,7 @@ class TestQuantPrimitives(unittest.TestCase):
         self.assertTrue(torch.equal(quantized, quantized_ref))
         self.assertTrue(torch.equal(dequantized, dequantized_ref))
 
-    @unittest.skipIf(not TORCH_VERSION_AFTER_2_3, "skipping when torch version is 2.3 or lower")
+    @unittest.skipIf(not TORCH_VERSION_AT_LEAST_2_3, "skipping when torch version is 2.3 or lower")
     def test_quantize_dequantize_channel_asym_4d_multi_dim_reduction(self):
         input = torch.randn(3, 3, 10, 10)
         mapping_type = MappingType.ASYMMETRIC
@@ -356,12 +453,10 @@ class TestQuantPrimitives(unittest.TestCase):
             )
 
 
-    def test_tinygemm_get_groupwise_affine_qparams(self):
-        from torchao.quantization.quant_primitives import ZeroPointDomain
-
+    def test_get_groupwise_affine_qparams(self):
         input = torch.randn(10, 256)
         n_bit = 4
-        scale_ref, zero_point_ref = get_groupwise_affine_qparams(input, n_bit=n_bit, groupsize=128, dtype=torch.bfloat16)
+        scale_ref, zero_point_ref = _get_groupwise_affine_qparams(input, n_bit=n_bit, groupsize=128, dtype=torch.bfloat16)
 
         mapping_type = MappingType.ASYMMETRIC
         dtype = torch.int8
@@ -389,6 +484,75 @@ class TestQuantPrimitives(unittest.TestCase):
         self.assertTrue(torch.equal(scale, scale_ref))
         self.assertTrue(torch.equal(zero_point, zero_point_ref))
 
+    def test_groupwise_affine_quantize_tensor_from_qparams(self):
+        input = torch.randn(10, 256)
+        scales = torch.randn(10, 2)
+        zeros = torch.randn(10, 2)
+        n_bit = 4
+        groupsize = 128
+
+        w_int4x8 = groupwise_affine_quantize_tensor_from_qparams(input, scales, zeros, n_bit, groupsize)
+        w_int4x8_ref = _groupwise_affine_quantize_tensor_from_qparams(input, scales, zeros, n_bit, groupsize)
+
+        self.assertTrue(torch.equal(w_int4x8, w_int4x8_ref))
+
+    def test_groupwise_affine_dequantize_tensor_from_qparams(self):
+        input = torch.randint(0, 15, (10, 256), dtype=torch.int32)
+        scales = torch.randn(10, 2).bfloat16()
+        zeros = torch.randn(10, 2).bfloat16()
+        n_bit = 4
+        groupsize = 128
+
+        if TORCH_VERSION_AT_LEAST_2_5:
+            input_uint8 = (input[::, ::2] << 4 | input[::, 1::2]).to(torch.uint8)
+            w_bf16 = groupwise_affine_dequantize_tensor_from_qparams(input_uint8, scales, zeros, n_bit, groupsize)
+        else:
+            w_bf16 = groupwise_affine_dequantize_tensor_from_qparams(input, scales, zeros, n_bit, groupsize)
+        w_bf16_ref = _groupwise_affine_dequantize_tensor_from_qparams(input, scales, zeros, n_bit, groupsize)
+
+        self.assertTrue(torch.equal(w_bf16, w_bf16_ref))
+
+    @unittest.skipIf(not TORCH_VERSION_AT_LEAST_2_4, "skipping when torch version is 2.4 or lower")
+    def test_fake_quantize_affine(self):
+        input = torch.randn(10, 10)
+
+        mapping_type = MappingType.SYMMETRIC
+        block_size = list(input.shape)
+        for i in range(len(block_size) - 1):
+            block_size[i] = 1
+        dtype = torch.int8
+        eps = 1e-5
+        quant_min = -127
+        quant_max = 127
+        scale, zero_point = choose_qparams_affine(input, mapping_type, block_size, dtype, quant_min, quant_max, eps=eps, scale_dtype=torch.float)
+
+        quantized = quantize_affine(input, block_size, scale, zero_point, dtype, quant_min, quant_max)
+        dequantized = dequantize_affine(quantized, block_size, scale, zero_point, dtype, quant_min, quant_max)
+        fake_quantized = fake_quantize_affine(input, block_size, scale, zero_point, dtype, quant_min, quant_max)
+        torch.testing.assert_close(dequantized, fake_quantized)
+
+    @unittest.skipIf(not TORCH_VERSION_AT_LEAST_2_4, "skipping when torch version is 2.4 or lower")
+    def test_fake_quantize_affine_cachemask(self):
+        input = torch.randn(10, 10)
+
+        mapping_type = MappingType.SYMMETRIC
+        block_size = list(input.shape)
+        for i in range(len(block_size) - 1):
+            block_size[i] = 1
+        dtype = torch.int8
+        eps = 1e-5
+        quant_min = -127
+        quant_max = 127
+        scale, zero_point = choose_qparams_affine(input, mapping_type, block_size, dtype, quant_min, quant_max, eps=eps, scale_dtype=torch.float)
+
+        quantized = quantize_affine(input, block_size, scale, zero_point, dtype, quant_min, quant_max)
+        dequantized = dequantize_affine(quantized, block_size, scale, zero_point, dtype, quant_min, quant_max)
+        (fake_quantized, mask) = fake_quantize_affine_cachemask(
+            input, block_size, scale, zero_point, dtype, quant_min, quant_max,
+        )
+        expected_mask = torch.full(input.shape, True)
+        torch.testing.assert_close(dequantized, fake_quantized)
+        torch.testing.assert_close(expected_mask, mask)
 
 if __name__ == "__main__":
     unittest.main()

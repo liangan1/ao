@@ -11,9 +11,10 @@ torchao.dtypes
     :nosignatures:
 
     to_nf4
-    UInt4Tensor
-    to_float6_e3m2
-    from_float6_e3m2
+    to_affine_quantized_intx
+    to_affine_quantized_floatx
+    to_affine_quantized_intx_static
+    AffineQuantizedTensor
 
 ..
   _NF4Tensor - add after fixing torchao/dtypes/nf4tensor.py:docstring
