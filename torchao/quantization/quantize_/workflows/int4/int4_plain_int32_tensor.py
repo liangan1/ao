@@ -91,8 +91,8 @@ class Int4PlainInt32Tensor(TorchAOBaseTensor):
         w: torch.Tensor,
         block_size: List[int],
     ):
-        assert w.ndim == 2 and w.device.type == "xpu", (
-            f"Expecting 2D tensor on XPU, but got: {w.shape} on {w.device.type}"
+        assert w.ndim == 2, (
+            f"Expecting 2D tensor on XPU, but got: {w.shape}"
         )
         assert len(block_size) == w.ndim
         assert w.dtype in [torch.float16, torch.bfloat16], (
@@ -131,7 +131,7 @@ class Int4PlainInt32Tensor(TorchAOBaseTensor):
         )
         packed_weight = (int_data[::, 1::2] << 4 | int_data[::, ::2]).to(torch.uint8)
         packed_weight = torch.ops.aten._convert_weight_to_int4pack(
-            packed_weight.contiguous(), 8
+            packed_weight.contiguous().to('xpu'), 8
         )
         scale = scale.reshape(int_data.shape[0], -1)
         zero_point = zero_point.reshape(int_data.shape[0], -1)
